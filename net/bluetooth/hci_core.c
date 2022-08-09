@@ -4124,7 +4124,7 @@ static void hci_cmd_work(struct work_struct *work)
 			    hci_dev_test_flag(hdev, HCI_CMD_DRAIN_WORKQUEUE))
 				cancel_delayed_work(&hdev->cmd_timer);
 			else
-				queue_delayed_work(hdev->workqueue, &hdev->cmd_timer,
+				queue_delayed_work(system_power_efficient_wq, &hdev->cmd_timer,
 						   HCI_CMD_TIMEOUT);
 			rcu_read_unlock();
 		} else {
