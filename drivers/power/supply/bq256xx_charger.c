@@ -216,6 +216,7 @@ enum bq256xx_id {
  * @charger: power supply registered for the charger
  * @battery: power supply registered for the battery
  * @lock: mutex lock structure
+ * @irq_lock: mutex lock structure for irq
  *
  * @usb2_phy: usb_phy identifier
  * @usb3_phy: usb_phy identifier
@@ -229,6 +230,9 @@ enum bq256xx_id {
  * @chip_info: device variant information
  * @state: device status and faults
  * @watchdog_timer: watchdog timer value in milliseconds
+ *
+ * @irq_waiting: flag for status of irq waiting
+ * @resume_completed: suspend/resume flag
  */
 struct bq256xx_device {
 	struct i2c_client *client;
@@ -236,6 +240,8 @@ struct bq256xx_device {
 	struct power_supply *charger;
 	struct power_supply *battery;
 	struct mutex lock;
+	struct mutex irq_lock;
+
 	struct regmap *regmap;
 
 	struct usb_phy *usb2_phy;
@@ -252,6 +258,9 @@ struct bq256xx_device {
 	int watchdog_timer;
 	/* extcon for VBUS / ID notification to USB*/
 	struct extcon_dev       *extcon;
+
+	bool irq_waiting;
+	bool resume_completed;
 };
 
 /**
@@ -1170,6 +1179,15 @@ static irqreturn_t bq256xx_irq_handler_thread(int irq, void *private)
 	struct bq256xx_state state;
 	int ret;
 
+	mutex_lock(&bq->irq_lock);
+	bq->irq_waiting = true;
+	if (!bq->resume_completed) {
+		pr_debug("IRQ triggered before device-resume\n");
+		disable_irq_nosync(irq);
+		mutex_unlock(&bq->irq_lock);
+		return IRQ_HANDLED;
+	}
+
 	ret = bq256xx_get_state(bq, &state);
 	if (ret < 0)
 		goto irq_out;
@@ -1184,6 +1202,8 @@ static irqreturn_t bq256xx_irq_handler_thread(int irq, void *private)
 	power_supply_changed(bq->charger);
 
 irq_out:
+	bq->irq_waiting = false;
+	mutex_unlock(&bq->irq_lock);
 	return IRQ_HANDLED;
 }
 
@@ -1661,8 +1681,10 @@ static int bq256xx_probe(struct i2c_client *client,
 	bq->client = client;
 	bq->dev = dev;
 	bq->chip_info = &bq256xx_chip_info_tbl[id->driver_data];
+	bq->resume_completed = true;
 
 	mutex_init(&bq->lock);
+	mutex_init(&bq->irq_lock);
 
 	strncpy(bq->model_name, id->name, I2C_NAME_SIZE);
 
@@ -1701,18 +1723,6 @@ static int bq256xx_probe(struct i2c_client *client,
 		usb_register_notifier(bq->usb3_phy, &bq->usb_nb);
 	}
 
-	if (client->irq) {
-		ret = devm_request_threaded_irq(dev, client->irq, NULL,
-						bq256xx_irq_handler_thread,
-						IRQF_TRIGGER_FALLING |
-						IRQF_ONESHOT,
-						dev_name(&client->dev), bq);
-		if (ret < 0) {
-			dev_err(dev, "get irq fail: %d\n", ret);
-			return ret;
-		}
-	}
-
 	ret = bq256xx_power_supply_init(bq, &psy_cfg, dev);
 	if (ret) {
 		dev_err(dev, "Failed to register power supply\n");
@@ -1746,6 +1756,23 @@ static int bq256xx_probe(struct i2c_client *client,
 		return ret;
 
 	extcon_set_state_sync(bq->extcon, EXTCON_USB, !!state.vbus_gd);
+
+	if (client->irq) {
+		ret = devm_request_threaded_irq(dev, client->irq, NULL,
+						bq256xx_irq_handler_thread,
+						IRQF_TRIGGER_FALLING |
+						IRQF_ONESHOT,
+						dev_name(&client->dev), bq);
+		if (ret < 0) {
+			dev_err(dev, "get irq fail: %d\n", ret);
+			return ret;
+		}
+
+		enable_irq_wake(client->irq);
+	}
+
+	dev_dbg(dev, "bq256xx successfully probed. charger=0x%x\n",
+		 state.vbus_gd);
 
 	return ret;
 }
@@ -1786,11 +1813,92 @@ static const struct acpi_device_id bq256xx_acpi_match[] = {
 };
 MODULE_DEVICE_TABLE(acpi, bq256xx_acpi_match);
 
+
+static int bq256xx_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct bq256xx_device *bq = i2c_get_clientdata(client);
+
+	mutex_lock(&bq->irq_lock);
+	bq->resume_completed = false;
+	mutex_unlock(&bq->irq_lock);
+
+	return 0;
+}
+
+static int bq256xx_suspend_noirq(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct bq256xx_device *bq = i2c_get_clientdata(client);
+
+	if (bq->irq_waiting) {
+		dev_err_ratelimited(dev, "Aborting suspend, an interrupt was detected while suspending\n");
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+static int bq256xx_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct bq256xx_device *bq = i2c_get_clientdata(client);
+
+	mutex_lock(&bq->irq_lock);
+	bq->resume_completed = true;
+	mutex_unlock(&bq->irq_lock);
+	if (bq->irq_waiting) {
+		/* irq was pending, call the handler */
+		bq256xx_irq_handler_thread(client->irq, bq);
+		enable_irq(client->irq);
+	}
+
+	return 0;
+}
+
+static int bq256xx_restore(struct device *dev)
+{
+	int ret = 0;
+	struct i2c_client *client = to_i2c_client(dev);
+	struct bq256xx_device *bq = i2c_get_clientdata(client);
+
+	if (client->irq > 0) {
+		disable_irq_nosync(client->irq);
+		devm_free_irq(dev, client->irq, bq);
+		/*
+		 * Set extcon state depending upon USB connect/disconnect state
+		 * on hibernation exit
+		 */
+		bq256xx_irq_handler_thread(client->irq, bq);
+		ret = devm_request_threaded_irq(dev, client->irq, NULL,
+						bq256xx_irq_handler_thread,
+						IRQF_TRIGGER_FALLING |
+						IRQF_ONESHOT,
+						dev_name(&client->dev), bq);
+		if (ret < 0) {
+			dev_err(dev, "get irq fail: %d\n", ret);
+			return ret;
+		}
+
+		enable_irq_wake(client->irq);
+	}
+
+	return ret;
+}
+
+static const struct dev_pm_ops  bq256xx_pm_ops = {
+	.suspend =  bq256xx_suspend,
+	.suspend_noirq = bq256xx_suspend_noirq,
+	.resume =  bq256xx_resume,
+	.restore = bq256xx_restore,
+};
+
 static struct i2c_driver bq256xx_driver = {
 	.driver = {
 		.name = "bq256xx-charger",
 		.of_match_table = bq256xx_of_match,
 		.acpi_match_table = bq256xx_acpi_match,
+		.pm = &bq256xx_pm_ops,
 	},
 	.probe = bq256xx_probe,
 	.id_table = bq256xx_i2c_ids,
