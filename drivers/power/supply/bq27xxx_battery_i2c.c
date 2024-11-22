@@ -145,8 +145,10 @@ static int bq27xx_parse_dt(struct bq27xxx_device_info *di,
 	int rc;
 
 	ret = of_property_read_u32(battery_np, "qmax-cell0", &di->qmax_cell0);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "Undefined Qmax-Cell0\n");
+		return ret;
+	}
 
 	rc = of_property_count_elems_of_size(battery_np, "resist-table",
 					     sizeof(u32));
@@ -229,9 +231,9 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client,
 	if (!battery_np_rt)
 		return -ENODEV;
 	ret = bq27xx_parse_dt(di, di->dev, battery_np_rt);
+	of_node_put(battery_np_rt);
 	if (ret)
 		return -EINVAL;
-	of_node_put(battery_np_rt);
 #endif
 
 	ret = bq27xxx_battery_setup(di);
